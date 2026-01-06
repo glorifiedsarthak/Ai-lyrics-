@@ -1,18 +1,54 @@
 
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import SettingsPanel from './components/SettingsPanel';
 import LyricSectionCard from './components/LyricSectionCard';
-import { generateLyrics } from './services/geminiService';
+import { generateLyrics, generateSongAudio } from './services/geminiService';
 import { SongLyrics, GeneratorParams } from './types';
+
+// Audio decoding utilities as per guidelines
+function decodeBase64(base64: string) {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number,
+  numChannels: number,
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
 
 const App: React.FC = () => {
   const [lyrics, setLyrics] = useState<SongLyrics | null>(null);
   const [loading, setLoading] = useState(false);
+  const [audioLoading, setAudioLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
 
   const handleGenerate = async (params: GeneratorParams) => {
     setLoading(true);
     setError(null);
+    stopAudio();
     try {
       const result = await generateLyrics(params);
       setLyrics(result);
@@ -21,6 +57,51 @@ const App: React.FC = () => {
       setError('Failed to compose lyrics. Please try again.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const stopAudio = () => {
+    if (sourceNodeRef.current) {
+      sourceNodeRef.current.stop();
+      sourceNodeRef.current = null;
+    }
+    setIsPlaying(false);
+  };
+
+  const handleCreateSong = async () => {
+    if (!lyrics) return;
+    setAudioLoading(true);
+    setError(null);
+    stopAudio();
+
+    const fullText = lyrics.sections
+      .map(s => s.lines.join('. '))
+      .join('. ');
+
+    try {
+      const base64Audio = await generateSongAudio(fullText);
+      
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      }
+      
+      const ctx = audioContextRef.current;
+      const audioBytes = decodeBase64(base64Audio);
+      const audioBuffer = await decodeAudioData(audioBytes, ctx, 24000, 1);
+      
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+      source.onended = () => setIsPlaying(false);
+      
+      source.start();
+      sourceNodeRef.current = source;
+      setIsPlaying(true);
+    } catch (err) {
+      console.error(err);
+      setError('Failed to generate song audio.');
+    } finally {
+      setAudioLoading(false);
     }
   };
 
@@ -109,14 +190,31 @@ const App: React.FC = () => {
                     <h2 className="text-4xl md:text-5xl font-serif mb-2">{lyrics.title}</h2>
                     <p className="text-slate-400 italic">An original AI-woven composition</p>
                   </div>
-                  <div className="flex gap-3">
+                  <div className="flex flex-wrap gap-3">
+                    <button 
+                      onClick={isPlaying ? stopAudio : handleCreateSong}
+                      disabled={audioLoading}
+                      className={`p-3 rounded-xl transition-all flex items-center gap-2 text-sm font-medium ${
+                        audioLoading ? 'bg-slate-800 opacity-50 cursor-not-allowed' : 
+                        isPlaying ? 'bg-red-600/20 text-red-400 hover:bg-red-600/30' : 'bg-purple-600/20 text-purple-400 hover:bg-purple-600/30'
+                      }`}
+                    >
+                      {audioLoading ? (
+                        <i className="fa-solid fa-spinner animate-spin"></i>
+                      ) : isPlaying ? (
+                        <i className="fa-solid fa-stop"></i>
+                      ) : (
+                        <i className="fa-solid fa-play"></i>
+                      )}
+                      {audioLoading ? 'Generating Song...' : isPlaying ? 'Stop Playing' : 'Create & Play Song'}
+                    </button>
                     <button 
                       onClick={copyToClipboard}
                       className="p-3 bg-slate-800 hover:bg-slate-700 rounded-xl transition-all flex items-center gap-2 text-sm font-medium"
                       title="Copy to clipboard"
                     >
                       <i className="fa-regular fa-copy"></i>
-                      Copy Lyrics
+                      Copy
                     </button>
                     <button 
                       onClick={() => window.print()}
@@ -154,7 +252,7 @@ const App: React.FC = () => {
       <footer className="mt-20 border-t border-white/5 py-12 px-6">
         <div className="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-center gap-8 opacity-40">
           <div className="text-sm">
-            Powered by Google Gemini 3 Flash
+            Powered by Google Gemini 2.5 & 3
           </div>
           <div className="flex gap-8 text-xs uppercase tracking-widest">
             <a href="#" className="hover:text-white transition-colors">Terms</a>
